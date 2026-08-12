@@ -18,9 +18,10 @@ RUN pip install --upgrade pip && pip install -r requirements-server.txt
 
 COPY api_server.py ./
 COPY labhub ./labhub
+COPY scripts/migrate_sqlite_to_postgres.py ./scripts/migrate_sqlite_to_postgres.py
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
 
-RUN mkdir -p /app/storage/uploads && chown -R labhub:labhub /app
+RUN mkdir -p /app/storage/uploads /app/scripts && chown -R labhub:labhub /app
 USER labhub
 
 EXPOSE 8000
