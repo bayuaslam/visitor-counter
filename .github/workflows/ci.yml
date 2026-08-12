@@ -70,9 +70,12 @@ jobs:
                       'X-LabHub-Device': 'lab-robotika-01',
                       'X-LabHub-Device-Token': 'test-edge-device-token-0123456789-abcdef',
                   },
-                  json={'occupancy': 0, 'mode': 'CI'},
+                  json={'occupancy': 0, 'mode': 'CI', 'counter_active': True},
               )
               assert hb.status_code == 200, hb.text
+              status = client.get('/api/counter/status')
+              assert status.status_code == 200, status.text
+              assert status.json()['active'] is True
           PY
 
   frontend-build:
@@ -100,6 +103,16 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip pip-audit
       - run: pip-audit -r requirements-server.txt
+
+  compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate production Compose template
+        run: |
+          cp .env.production.example .env
+          docker compose config --quiet
+          rm .env
 
   docker-build:
     runs-on: ubuntu-latest
