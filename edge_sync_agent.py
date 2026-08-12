@@ -1,11 +1,13 @@
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
@@ -14,7 +16,17 @@ DB_FILE = BASE_DIR / "lab_visitors.db"
 HEARTBEAT_FILE = BASE_DIR / "counter_heartbeat"
 RESET_REQUEST_FILE = BASE_DIR / "counter_reset.request"
 STATE_FILE = BASE_DIR / "edge_sync_state.json"
+LOG_FILE = BASE_DIR / "edge-sync.log"
 WIB = timezone(timedelta(hours=7))
+COUNTER_HEARTBEAT_MAX_AGE = 15
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8")],
+)
+logger = logging.getLogger("smartlab-edge")
 
 
 def load_local_env():
@@ -40,8 +52,12 @@ COMMAND_INTERVAL = max(2.0, float(os.getenv("LABHUB_EDGE_COMMAND_INTERVAL", "5")
 
 
 def require_config():
-    if not SERVER_URL.startswith(("http://", "https://")):
-        raise RuntimeError("LABHUB_SERVER_URL belum diisi dengan URL server")
+    parsed = urlparse(SERVER_URL)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("LABHUB_SERVER_URL belum diisi dengan URL server yang valid")
+    if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost"}:
+        if os.getenv("LABHUB_EDGE_ALLOW_HTTP", "0").strip() != "1":
+            raise RuntimeError("Server edge production wajib menggunakan HTTPS")
     if len(DEVICE_TOKEN) < 24:
         raise RuntimeError("LABHUB_EDGE_DEVICE_TOKEN minimal 24 karakter")
     if not DEVICE_ID:
@@ -51,6 +67,7 @@ def require_config():
 def api_headers():
     return {
         "Content-Type": "application/json",
+        "User-Agent": "SmartLab-Edge/2.0",
         "X-LabHub-Device": DEVICE_ID,
         "X-LabHub-Device-Token": DEVICE_TOKEN,
     }
@@ -76,6 +93,7 @@ def load_state():
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return {"last_synced_id": max(0, int(data.get("last_synced_id", 0)))}
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        logger.warning("State edge rusak/tidak terbaca; mulai dari ID 0 dengan deduplikasi server.")
         return {"last_synced_id": 0}
 
 
@@ -94,6 +112,31 @@ def get_local_connection():
     return conn
 
 
+def max_local_event_id():
+    conn = get_local_connection()
+    if conn is None:
+        return 0
+    try:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM visitor_events").fetchone()
+        return int(row["max_id"]) if row else 0
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        conn.close()
+
+
+def reconcile_state(state):
+    max_id = max_local_event_id()
+    if max_id < state["last_synced_id"]:
+        logger.warning(
+            "Database lokal tampak dibuat ulang (max_id=%s < last_synced_id=%s). Reset pointer sync ke 0.",
+            max_id,
+            state["last_synced_id"],
+        )
+        state["last_synced_id"] = 0
+        save_state(state)
+
+
 def local_occupancy():
     conn = get_local_connection()
     if conn is None:
@@ -103,22 +146,31 @@ def local_occupancy():
             "SELECT occupancy FROM counter_state WHERE id = 1"
         ).fetchone()
         return max(0, int(row["occupancy"])) if row else 0
+    except sqlite3.OperationalError:
+        return 0
     finally:
         conn.close()
 
 
+def counter_heartbeat_details():
+    if not HEARTBEAT_FILE.exists():
+        return {}, False
+    try:
+        age = time.time() - HEARTBEAT_FILE.stat().st_mtime
+        details = json.loads(HEARTBEAT_FILE.read_text(encoding="utf-8"))
+        return details, age <= COUNTER_HEARTBEAT_MAX_AGE
+    except (OSError, json.JSONDecodeError):
+        return {}, False
+
+
 def heartbeat_payload():
-    details = {}
-    if HEARTBEAT_FILE.exists():
-        try:
-            details = json.loads(HEARTBEAT_FILE.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            details = {}
+    details, counter_active = counter_heartbeat_details()
     return {
         "camera_ip": details.get("camera_ip"),
         "stream": details.get("stream"),
         "mode": details.get("mode", "Edge"),
         "occupancy": local_occupancy(),
+        "counter_active": counter_active,
     }
 
 
@@ -151,11 +203,14 @@ def pending_events(last_synced_id, limit=100):
             (last_synced_id, limit),
         ).fetchall()
         return rows
+    except sqlite3.OperationalError:
+        return []
     finally:
         conn.close()
 
 
 def sync_events(state):
+    reconcile_state(state)
     rows = pending_events(state["last_synced_id"])
     if not rows:
         return False
@@ -175,9 +230,11 @@ def sync_events(state):
     result = request_json("POST", "/api/edge/events", payload)
     state["last_synced_id"] = int(rows[-1]["id"])
     save_state(state)
-    print(
-        f"Sync event sampai ID {state['last_synced_id']} "
-        f"(accepted={result.get('accepted', 0)}, duplicate={result.get('duplicates', 0)})"
+    logger.info(
+        "Sync event sampai ID %s (accepted=%s, duplicate=%s)",
+        state["last_synced_id"],
+        result.get("accepted", 0),
+        result.get("duplicates", 0),
     )
     return True
 
@@ -196,9 +253,9 @@ def process_commands():
                 datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S"),
                 encoding="utf-8",
             )
-            print(f"Command RESET_COUNTER #{command_id} diteruskan ke visitor counter.")
+            logger.info("Command RESET_COUNTER #%s diteruskan ke visitor counter.", command_id)
         else:
-            print(f"Command #{command_id} tidak dikenal: {command_name}")
+            logger.warning("Command #%s tidak dikenal: %s", command_id, command_name)
         request_json("POST", f"/api/edge/commands/{command_id}/ack", {})
 
 
@@ -208,13 +265,7 @@ def main():
     last_heartbeat = 0.0
     last_command_check = 0.0
 
-    print("======================================")
-    print("SMARTLAB EDGE SYNC AGENT")
-    print("======================================")
-    print(f"Server : {SERVER_URL}")
-    print(f"Device : {DEVICE_ID}")
-    print("Ctrl+C untuk berhenti.")
-    print("")
+    logger.info("SmartLab Edge Sync aktif. server=%s device=%s", SERVER_URL, DEVICE_ID)
 
     while True:
         now = time.monotonic()
@@ -233,9 +284,11 @@ def main():
 
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
-            print(f"Server menolak request: HTTP {error.code} {detail[:300]}")
+            logger.error("Server menolak request: HTTP %s %s", error.code, detail[:300])
         except (URLError, TimeoutError, OSError, sqlite3.Error, ValueError) as error:
-            print(f"Sync tertunda: {error}")
+            logger.warning("Sync tertunda: %s", error)
+        except Exception:
+            logger.exception("Error edge sync tidak terduga; proses tetap mencoba ulang.")
 
         time.sleep(SYNC_INTERVAL)
 
@@ -244,4 +297,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nEdge sync agent dihentikan.")
+        logger.info("Edge sync agent dihentikan.")
