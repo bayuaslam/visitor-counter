@@ -15,7 +15,6 @@ backups
 frontend/node_modules
 frontend/dist
 tests
-scripts
 visitor_counter.py
 edge_sync_agent.py
 preview_camera.py
