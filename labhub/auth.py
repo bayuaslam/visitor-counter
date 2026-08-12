@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import Header, HTTPException, Request
 
 
-ALLOWED_ROLES = {"STUDENT", "LECTURER", "LABORAN", "ADMIN"}
+ALLOWED_ROLES = {"STUDENT", "LECTURER", "LABORAN", "ADMIN", "GUEST"}
 SESSION_COOKIE = "labhub_admin_session"
 STUDENT_SESSION_COOKIE = "labhub_student_session"
 SESSION_HOURS = 8
@@ -149,12 +149,12 @@ def current_user(
         raise HTTPException(status_code=401, detail="Role tidak valid")
     if role in {"LABORAN", "ADMIN"} and not valid_admin_session(request.cookies.get(SESSION_COOKIE)):
         raise HTTPException(status_code=401, detail="Silakan login sebagai laboran")
-    if role in {"STUDENT", "LECTURER"}:
+    if role in {"STUDENT", "LECTURER", "GUEST"}:
         session = student_session(request.cookies.get(STUDENT_SESSION_COOKIE))
         if not session:
             raise HTTPException(status_code=401, detail="Silakan login dengan email UII")
         if session.get("role") == "GUEST":
-            return CurrentUser(user_id=str(session["sub"])[:120], name="Tamu", role="STUDENT")
+            return CurrentUser(user_id=str(session["sub"])[:120], name="Tamu", role="GUEST")
         email = str(session["sub"])[:190]
         return CurrentUser(user_id=email, name=email.split("@", 1)[0].replace(".", " ").title(), role="STUDENT")
     return CurrentUser(user_id=x_labhub_user[:120], name=x_labhub_name[:160], role=role)
