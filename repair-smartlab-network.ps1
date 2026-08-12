@@ -32,21 +32,7 @@ try {
     $finalAddress = Get-NetIPAddress -InterfaceAlias "Ethernet" -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty IPAddress
     Write-RecoveryLog ("Pemulihan selesai. IP Ethernet: " + ($finalAddress -join ", "))
-
-    $heartbeatPath = "C:\visitor-counter\counter_heartbeat"
-    $counterActive = Test-Path -LiteralPath $heartbeatPath
-    if ($counterActive) {
-        $counterActive = (Get-Date) - (Get-Item -LiteralPath $heartbeatPath).LastWriteTime -lt (New-TimeSpan -Seconds 15)
-    }
-
-    if (-not $counterActive) {
-        Write-RecoveryLog "Heartbeat counter berhenti; menjalankan visitor counter kembali."
-        Start-Process `
-            -FilePath "C:\visitor-counter\.venv\Scripts\pythonw.exe" `
-            -ArgumentList "C:\visitor-counter\visitor_counter.py" `
-            -WorkingDirectory "C:\visitor-counter" `
-            -WindowStyle Hidden
-    }
+    Write-RecoveryLog "Proses visitor counter tidak dijalankan sebagai SYSTEM; gunakan SmartLab Edge Tasks agar DPAPI kamera tetap memakai akun Windows pemilik kredensial."
 }
 catch {
     Write-RecoveryLog ("GAGAL: " + $_.Exception.Message)

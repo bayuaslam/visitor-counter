@@ -1,9 +1,20 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from labhub.database import Base
+
+
+WIB = timezone(timedelta(hours=7))
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def jakarta_now_naive() -> datetime:
+    return datetime.now(WIB).replace(tzinfo=None)
 
 
 class Equipment(Base):
@@ -27,11 +38,11 @@ class Equipment(Base):
     location: Mapped[str] = mapped_column(String(160), default="")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     photo_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.now,
-        onupdate=datetime.now,
+        default=jakarta_now_naive,
+        onupdate=jakarta_now_naive,
     )
 
 
@@ -41,7 +52,19 @@ class StudentUser(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(190), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(300))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive)
+
+
+class PendingRegistration(Base):
+    __tablename__ = "pending_registrations"
+
+    email: Mapped[str] = mapped_column(String(190), primary_key=True)
+    password_hash: Mapped[str] = mapped_column(String(300))
+    code_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    last_sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
 class LabSetting(Base):
@@ -49,7 +72,7 @@ class LabSetting(Base):
 
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[str] = mapped_column(String(200))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive, onupdate=jakarta_now_naive)
 
 
 class ServiceRequest(Base):
@@ -75,8 +98,8 @@ class ServiceRequest(Base):
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     admin_note: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive, onupdate=jakarta_now_naive)
 
 
 class Notification(Base):
@@ -90,4 +113,52 @@ class Notification(Base):
     message: Mapped[str] = mapped_column(Text)
     request_id: Mapped[int | None] = mapped_column(ForeignKey("service_requests.id", ondelete="SET NULL"), nullable=True, index=True)
     read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive, index=True)
+
+
+class VisitorEvent(Base):
+    __tablename__ = "visitor_events_cloud"
+    __table_args__ = (
+        CheckConstraint("direction IN ('IN', 'OUT')", name="ck_visitor_event_direction"),
+        CheckConstraint("occupancy_after >= 0", name="ck_visitor_event_occupancy_nonnegative"),
+        UniqueConstraint("event_uuid", name="uq_visitor_event_uuid"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_uuid: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    device_id: Mapped[str] = mapped_column(String(80), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    track_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    direction: Mapped[str] = mapped_column(String(8), index=True)
+    occupancy_after: Mapped[int] = mapped_column(Integer)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class CounterState(Base):
+    __tablename__ = "counter_states"
+
+    device_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    occupancy: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class EdgeDeviceState(Base):
+    __tablename__ = "edge_device_states"
+
+    device_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    camera_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    stream: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    mode: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    counter_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class DeviceCommand(Base):
+    __tablename__ = "device_commands"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    device_id: Mapped[str] = mapped_column(String(80), index=True)
+    command: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)

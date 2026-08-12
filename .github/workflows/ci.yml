@@ -1,0 +1,128 @@
+name: Production Migration CI
+
+on:
+  push:
+    branches: [production-migration]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements-server.txt -r requirements-dev.txt
+      - run: python -m compileall -q api_server.py edge_sync_agent.py labhub scripts tests
+      - run: pytest -q
+
+  postgres-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: labhub_test
+          POSTGRES_USER: labhub
+          POSTGRES_PASSWORD: test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U labhub -d labhub_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-server.txt -r requirements-dev.txt
+      - name: Smoke test FastAPI against PostgreSQL
+        env:
+          DATABASE_URL: postgresql+psycopg://labhub:test-password@127.0.0.1:5432/labhub_test
+          LABHUB_ENV: test
+          LABHUB_COOKIE_SECURE: "0"
+          LABHUB_ALLOWED_HOSTS: testserver,localhost,127.0.0.1
+          LABHUB_ALLOWED_ORIGINS: http://testserver
+          LABHUB_SESSION_SECRET: test-session-secret-0123456789-abcdefghijklmnopqrstuvwxyz
+          LABHUB_EDGE_DEVICE_ID: lab-robotika-01
+          LABHUB_EDGE_DEVICE_TOKEN: test-edge-device-token-0123456789-abcdef
+        run: |
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          import api_server
+
+          with TestClient(api_server.app) as client:
+              health = client.get('/api/health')
+              assert health.status_code == 200, health.text
+              hb = client.post(
+                  '/api/edge/heartbeat',
+                  headers={
+                      'X-LabHub-Device': 'lab-robotika-01',
+                      'X-LabHub-Device-Token': 'test-edge-device-token-0123456789-abcdef',
+                  },
+                  json={'occupancy': 0, 'mode': 'CI', 'counter_active': True},
+              )
+              assert hb.status_code == 200, hb.text
+              status = client.get('/api/counter/status')
+              assert status.status_code == 200, status.text
+              assert status.json()['active'] is True
+          PY
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm audit --audit-level=high
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pip-audit
+      - run: pip-audit -r requirements-server.txt
+
+  compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate production Compose template
+        run: |
+          cp .env.production.example .env
+          docker compose config --quiet
+          rm .env
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: labhub:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

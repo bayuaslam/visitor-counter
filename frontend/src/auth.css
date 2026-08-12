@@ -1,0 +1,230 @@
+.auth-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(7, 24, 18, 0.58);
+  backdrop-filter: blur(8px);
+}
+
+.auth-card {
+  position: relative;
+  width: min(440px, 100%);
+  padding: 32px;
+  border: 1px solid rgba(20, 92, 65, 0.15);
+  border-radius: 24px;
+  background: #fff;
+  box-shadow: 0 24px 80px rgba(10, 42, 31, 0.22);
+}
+
+.auth-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: #f1f5f3;
+  cursor: pointer;
+}
+
+.auth-mark {
+  width: 52px;
+  height: 52px;
+  display: grid;
+  place-items: center;
+  margin-bottom: 18px;
+  border-radius: 16px;
+  color: #fff;
+  background: #145c41;
+}
+
+.auth-eyebrow {
+  margin: 0 0 7px;
+  color: #42705f;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.auth-card h1 {
+  margin: 0;
+  color: #102a20;
+  font-size: clamp(1.65rem, 4vw, 2.1rem);
+}
+
+.auth-description {
+  margin: 10px 0 24px;
+  color: #5a6f66;
+  line-height: 1.55;
+}
+
+.auth-form {
+  display: grid;
+  gap: 16px;
+}
+
+.auth-form label {
+  display: grid;
+  gap: 7px;
+  color: #24483a;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.auth-form input {
+  width: 100%;
+  min-height: 46px;
+  box-sizing: border-box;
+  padding: 0 13px;
+  border: 1px solid #cad8d2;
+  border-radius: 12px;
+  outline: none;
+  font: inherit;
+  color: #102a20;
+  background: #fff;
+}
+
+.auth-form input:focus {
+  border-color: #247653;
+  box-shadow: 0 0 0 3px rgba(36, 118, 83, 0.12);
+}
+
+.auth-form .auth-code {
+  text-align: center;
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: 0.28em;
+}
+
+.auth-primary,
+.auth-guest {
+  min-height: 46px;
+  border-radius: 12px;
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.auth-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  color: #fff;
+  background: #145c41;
+}
+
+.auth-primary:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.auth-guest {
+  width: 100%;
+  margin-top: 12px;
+  border: 1px solid #cad8d2;
+  color: #24483a;
+  background: #fff;
+}
+
+.auth-switch {
+  margin-top: 18px;
+  text-align: center;
+}
+
+.auth-switch button {
+  border: 0;
+  color: #145c41;
+  background: transparent;
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.auth-message {
+  padding: 11px 13px;
+  border-radius: 10px;
+  color: #71440d;
+  background: #fff4df;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.auth-loading {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 12px;
+  color: #36584b;
+  background: #f4f7f5;
+}
+
+.auth-loading span {
+  width: 30px;
+  height: 30px;
+  border: 3px solid #d7e3de;
+  border-top-color: #145c41;
+  border-radius: 50%;
+  animation: auth-spin 0.8s linear infinite;
+}
+
+.auth-session-chip {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(20, 92, 65, 0.15);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 10px 35px rgba(10, 42, 31, 0.14);
+  backdrop-filter: blur(8px);
+}
+
+.auth-session-chip span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  overflow: hidden;
+  padding: 0 6px;
+  color: #36584b;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-session-chip button {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 9px;
+  color: #145c41;
+  background: #eaf3ef;
+  font: inherit;
+  font-size: 0.76rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+@keyframes auth-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 640px) {
+  .auth-card { padding: 26px 20px; border-radius: 20px; }
+  .auth-session-chip { left: 12px; right: 12px; bottom: 72px; justify-content: flex-end; }
+  .auth-session-chip span { margin-right: auto; }
+}
