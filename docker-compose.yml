@@ -24,7 +24,7 @@ services:
       LABHUB_ENV: production
       LABHUB_COOKIE_SECURE: "1"
       LABHUB_TRUST_PROXY: "1"
-      LABHUB_ALLOWED_HOSTS: ${LABHUB_DOMAIN}
+      LABHUB_ALLOWED_HOSTS: ${LABHUB_DOMAIN},127.0.0.1,localhost
       LABHUB_ALLOWED_ORIGINS: https://${LABHUB_DOMAIN}
       DATABASE_URL: postgresql+psycopg://labhub:${POSTGRES_PASSWORD}@db:5432/labhub
       LABHUB_UPLOAD_DIR: /data/uploads
