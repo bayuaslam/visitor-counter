@@ -58,7 +58,10 @@ ALLOWED_HOSTS = [
 
 app = FastAPI(
     title="Lab Robotika Visitor API",
-    version="2.0.0"
+    version="2.0.0",
+    docs_url=None if ENVIRONMENT == "production" else "/docs",
+    redoc_url=None if ENVIRONMENT == "production" else "/redoc",
+    openapi_url=None if ENVIRONMENT == "production" else "/openapi.json",
 )
 
 
@@ -171,6 +174,7 @@ class EdgeHeartbeatPayload(BaseModel):
     stream: str | None = None
     mode: str | None = None
     occupancy: int = 0
+    counter_active: bool = False
 
 
 class EdgeVisitorEventPayload(BaseModel):
@@ -399,6 +403,7 @@ def edge_heartbeat(
     device.camera_ip = (payload.camera_ip or "")[:64] or None
     device.stream = (payload.stream or "")[:120] or None
     device.mode = (payload.mode or "")[:80] or None
+    device.counter_active = bool(payload.counter_active)
     device.last_seen_at = now
 
     counter = session.get(CounterState, device_id)
@@ -528,10 +533,12 @@ def counter_status(session: Session = Depends(get_session)):
     device_id = configured_device_id()
     device = session.get(EdgeDeviceState, device_id)
     last_seen = as_utc(device.last_seen_at) if device else None
-    active = bool(last_seen and utc_now() - last_seen <= timedelta(seconds=15))
+    edge_connected = bool(last_seen and utc_now() - last_seen <= timedelta(seconds=15))
+    active = bool(edge_connected and device and device.counter_active)
     camera_status = "connected" if device and device.camera_ip else "—"
     return {
         "active": active,
+        "edge_connected": edge_connected,
         "status": "LIVE" if active else "OFFLINE",
         "last_heartbeat": last_seen.isoformat() if last_seen else None,
         "camera_ip": device.camera_ip if device and ENVIRONMENT != "production" else camera_status,
@@ -941,13 +948,12 @@ def create_request(
 @app.post("/api/requests/{request_id}/file", response_model=ServiceRequestItem)
 async def upload_request_file(
     request_id: int,
+    request: Request,
     upload: UploadFile = File(...),
-    request: Request = None,
     user: CurrentUser = Depends(current_user),
     session: Session = Depends(get_session),
 ):
-    if request is not None:
-        enforce_rate_limit(request, "service-upload", 30, 3600)
+    enforce_rate_limit(request, "service-upload", 30, 3600)
     if user.role == "GUEST":
         raise HTTPException(status_code=403, detail="Login dengan email UII diperlukan")
     item = session.get(ServiceRequest, request_id)
@@ -960,6 +966,22 @@ async def upload_request_file(
     content = await upload.read(20 * 1024 * 1024 + 1)
     if len(content) > 20 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Ukuran file maksimal 20 MB")
+    if not content:
+        raise HTTPException(status_code=422, detail="File kosong")
+    if extension == ".3mf" and not content.startswith(b"PK"):
+        raise HTTPException(status_code=422, detail="File 3MF tidak valid")
+    image_signatures = {
+        ".jpg": (b"\xff\xd8\xff",),
+        ".jpeg": (b"\xff\xd8\xff",),
+        ".png": (b"\x89PNG\r\n\x1a\n",),
+        ".webp": (b"RIFF",),
+    }
+    if extension in image_signatures:
+        signatures = image_signatures[extension]
+        if not any(content.startswith(signature) for signature in signatures):
+            raise HTTPException(status_code=422, detail="Isi file gambar tidak sesuai extension")
+        if extension == ".webp" and (len(content) < 12 or content[8:12] != b"WEBP"):
+            raise HTTPException(status_code=422, detail="File WebP tidak valid")
     folder = UPLOAD_DIR / item.request_type.lower() / datetime.now(WIB).strftime("%Y/%m")
     folder.mkdir(parents=True, exist_ok=True)
     safe_name = f"{item.request_code}_{uuid4().hex[:8]}{extension}"
