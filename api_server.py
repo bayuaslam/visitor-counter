@@ -1,9 +1,8 @@
 from pathlib import Path
 import json
-import sqlite3
-import time
+import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -17,7 +16,8 @@ from pydantic import BaseModel
 
 from labhub.auth import CurrentUser, SESSION_COOKIE, STUDENT_SESSION_COOKIE, create_admin_session, create_guest_session, create_student_session, current_user, hash_password, student_session, valid_admin_session, verify_admin_password, verify_password
 from labhub.database import get_session, init_database
-from labhub.models import Equipment, LabSetting, Notification, ServiceRequest, StudentUser
+from labhub.edge_auth import configured_device_id, require_edge_device
+from labhub.models import CounterState, DeviceCommand, EdgeDeviceState, Equipment, LabSetting, Notification, ServiceRequest, StudentUser, VisitorEvent
 from labhub.repositories.equipment import equipment_summary, list_equipment
 from labhub.repositories.requests import list_requests, request_counts, request_to_dict, room_has_overlap
 from labhub.schemas import EquipmentCreate, EquipmentItem, EquipmentList, EquipmentSummary, EquipmentUpdate, ServiceRequestCreate, ServiceRequestItem, StatusUpdate
@@ -25,13 +25,30 @@ from labhub.xlsx_import import read_first_sheet
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_FILE = BASE_DIR / "lab_visitors.db"
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
-UPLOAD_DIR = BASE_DIR / "storage" / "uploads"
+UPLOAD_DIR = Path(os.getenv("LABHUB_UPLOAD_DIR", str(BASE_DIR / "storage" / "uploads")))
+WIB = timezone(timedelta(hours=7))
+ENVIRONMENT = os.getenv("LABHUB_ENV", "development").strip().lower()
+COOKIE_SECURE = os.getenv(
+    "LABHUB_COOKIE_SECURE",
+    "1" if ENVIRONMENT == "production" else "0",
+).strip() == "1"
+ALLOW_UNVERIFIED_REGISTRATION = os.getenv(
+    "LABHUB_ALLOW_UNVERIFIED_REGISTRATION",
+    "0" if ENVIRONMENT == "production" else "1",
+).strip() == "1"
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "LABHUB_ALLOWED_ORIGINS",
+        "http://127.0.0.1:5173,http://localhost:5173",
+    ).split(",")
+    if origin.strip()
+]
 
 app = FastAPI(
     title="Lab Robotika Visitor API",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 
@@ -39,15 +56,40 @@ app = FastAPI(
 def startup():
     init_database()
 
-# Untuk tahap development agar website lokal gampang mengambil data.
-# Nanti saat website production sudah punya domain, origin ini kita batasi.
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Content-Type", "X-LabHub-User", "X-LabHub-Name", "X-LabHub-Role"],
+    allow_headers=[
+        "Content-Type",
+        "X-LabHub-User",
+        "X-LabHub-Name",
+        "X-LabHub-Role",
+        "X-LabHub-Device",
+        "X-LabHub-Device-Token",
+    ],
 )
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def wib_day_bounds(target_date: date | None = None) -> tuple[datetime, datetime]:
+    day = target_date or datetime.now(WIB).date()
+    start_local = datetime.combine(day, dt_time.min, tzinfo=WIB)
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
 class AdminLoginPayload(BaseModel):
@@ -63,6 +105,25 @@ class LabStatusPayload(BaseModel):
     is_open: bool
 
 
+class EdgeHeartbeatPayload(BaseModel):
+    camera_ip: str | None = None
+    stream: str | None = None
+    mode: str | None = None
+    occupancy: int = 0
+
+
+class EdgeVisitorEventPayload(BaseModel):
+    event_uuid: str
+    timestamp: datetime
+    track_id: int | None = None
+    direction: str
+    occupancy_after: int
+
+
+class EdgeVisitorEventBatch(BaseModel):
+    events: list[EdgeVisitorEventPayload]
+
+
 @app.post("/api/admin/login")
 def admin_login(payload: AdminLoginPayload, response: Response):
     if not verify_admin_password(payload.password):
@@ -74,7 +135,7 @@ def admin_login(payload: AdminLoginPayload, response: Response):
         max_age=max_age,
         httponly=True,
         samesite="strict",
-        secure=False,
+        secure=COOKIE_SECURE,
         path="/",
     )
     return {"authenticated": True, "name": "Laboran"}
@@ -103,11 +164,24 @@ def normalized_uii_email(value: str) -> str:
 
 def set_student_cookie(response: Response, email: str):
     token, max_age = create_student_session(email)
-    response.set_cookie(STUDENT_SESSION_COOKIE, token, max_age=max_age, httponly=True, samesite="strict", secure=False, path="/")
+    response.set_cookie(
+        STUDENT_SESSION_COOKIE,
+        token,
+        max_age=max_age,
+        httponly=True,
+        samesite="strict",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
 
 
 @app.post("/api/auth/register", status_code=201)
 def student_register(payload: StudentAuthPayload, response: Response, session: Session = Depends(get_session)):
+    if not ALLOW_UNVERIFIED_REGISTRATION:
+        raise HTTPException(
+            status_code=503,
+            detail="Registrasi production dinonaktifkan sampai verifikasi email UII/SSO diaktifkan",
+        )
     email = normalized_uii_email(payload.email)
     if len(payload.password) < 8:
         raise HTTPException(status_code=422, detail="Password minimal 8 karakter")
@@ -133,7 +207,15 @@ def student_login(payload: StudentAuthPayload, response: Response, session: Sess
 @app.post("/api/auth/guest")
 def guest_login(response: Response):
     token, max_age = create_guest_session()
-    response.set_cookie(STUDENT_SESSION_COOKIE, token, max_age=max_age, httponly=True, samesite="strict", secure=False, path="/")
+    response.set_cookie(
+        STUDENT_SESSION_COOKIE,
+        token,
+        max_age=max_age,
+        httponly=True,
+        samesite="strict",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
     return {"authenticated": True, "email": "Tamu", "guest": True}
 
 
@@ -154,58 +236,227 @@ def student_logout(response: Response):
     return {"authenticated": False}
 
 
-def get_connection():
-    if not DB_FILE.exists():
-        raise HTTPException(
-            status_code=503,
-            detail="Database lab_visitors.db belum ditemukan. Jalankan visitor_counter.py dulu."
-        )
-
-    conn = sqlite3.connect(DB_FILE, timeout=5)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
-
-
 @app.get("/api/health")
 def health():
     return {
         "status": "ok",
-        "service": "Lab Robotika Visitor API"
+        "service": "Lab Robotika Visitor API",
+        "environment": ENVIRONMENT,
     }
 
 
+@app.post("/api/edge/heartbeat")
+def edge_heartbeat(
+    payload: EdgeHeartbeatPayload,
+    device_id: str = Depends(require_edge_device),
+    session: Session = Depends(get_session),
+):
+    if payload.occupancy < 0:
+        raise HTTPException(status_code=422, detail="Occupancy tidak boleh negatif")
+
+    now = utc_now()
+    device = session.get(EdgeDeviceState, device_id)
+    if device is None:
+        device = EdgeDeviceState(device_id=device_id)
+        session.add(device)
+    device.camera_ip = (payload.camera_ip or "")[:64] or None
+    device.stream = (payload.stream or "")[:120] or None
+    device.mode = (payload.mode or "")[:80] or None
+    device.last_seen_at = now
+
+    counter = session.get(CounterState, device_id)
+    if counter is None:
+        counter = CounterState(device_id=device_id, occupancy=payload.occupancy, updated_at=now)
+        session.add(counter)
+    else:
+        counter.occupancy = payload.occupancy
+        counter.updated_at = now
+
+    session.commit()
+    return {"status": "ok", "server_time": now.isoformat()}
+
+
+@app.post("/api/edge/events")
+def edge_events(
+    payload: EdgeVisitorEventBatch,
+    device_id: str = Depends(require_edge_device),
+    session: Session = Depends(get_session),
+):
+    if not payload.events:
+        return {"accepted": 0, "duplicates": 0}
+    if len(payload.events) > 500:
+        raise HTTPException(status_code=413, detail="Maksimal 500 event per batch")
+
+    accepted = 0
+    duplicates = 0
+    counter = session.get(CounterState, device_id)
+
+    for incoming in payload.events:
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", incoming.event_uuid):
+            raise HTTPException(status_code=422, detail="event_uuid tidak valid")
+        direction = incoming.direction.strip().upper()
+        if direction not in {"IN", "OUT"}:
+            raise HTTPException(status_code=422, detail="Direction harus IN atau OUT")
+        if incoming.occupancy_after < 0:
+            raise HTTPException(status_code=422, detail="occupancy_after tidak boleh negatif")
+
+        existing = session.query(VisitorEvent.id).filter(
+            VisitorEvent.event_uuid == incoming.event_uuid
+        ).first()
+        if existing:
+            duplicates += 1
+            continue
+
+        occurred_at = incoming.timestamp
+        if occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=WIB)
+        occurred_at = occurred_at.astimezone(timezone.utc)
+
+        session.add(
+            VisitorEvent(
+                event_uuid=incoming.event_uuid,
+                device_id=device_id,
+                occurred_at=occurred_at,
+                track_id=incoming.track_id,
+                direction=direction,
+                occupancy_after=incoming.occupancy_after,
+            )
+        )
+        accepted += 1
+
+        if counter is None:
+            counter = CounterState(
+                device_id=device_id,
+                occupancy=incoming.occupancy_after,
+                updated_at=occurred_at,
+            )
+            session.add(counter)
+        elif as_utc(counter.updated_at) is None or occurred_at >= as_utc(counter.updated_at):
+            counter.occupancy = incoming.occupancy_after
+            counter.updated_at = occurred_at
+
+    session.commit()
+    return {"accepted": accepted, "duplicates": duplicates}
+
+
+@app.get("/api/edge/commands")
+def edge_commands(
+    device_id: str = Depends(require_edge_device),
+    session: Session = Depends(get_session),
+):
+    rows = (
+        session.query(DeviceCommand)
+        .filter(
+            DeviceCommand.device_id == device_id,
+            DeviceCommand.acknowledged_at.is_(None),
+        )
+        .order_by(DeviceCommand.created_at.asc(), DeviceCommand.id.asc())
+        .limit(20)
+        .all()
+    )
+    return {
+        "commands": [
+            {
+                "id": row.id,
+                "command": row.command,
+                "payload": json.loads(row.payload_json) if row.payload_json else {},
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/api/edge/commands/{command_id}/ack")
+def acknowledge_edge_command(
+    command_id: int,
+    device_id: str = Depends(require_edge_device),
+    session: Session = Depends(get_session),
+):
+    command = (
+        session.query(DeviceCommand)
+        .filter(DeviceCommand.id == command_id, DeviceCommand.device_id == device_id)
+        .first()
+    )
+    if not command:
+        raise HTTPException(status_code=404, detail="Command tidak ditemukan")
+    if command.acknowledged_at is None:
+        command.acknowledged_at = utc_now()
+        session.commit()
+    return {"status": "ok"}
+
+
 @app.get("/api/counter/status")
-def counter_status():
-    heartbeat = BASE_DIR / "counter_heartbeat"
-    active = heartbeat.exists() and time.time() - heartbeat.stat().st_mtime <= 10
-    last_heartbeat = datetime.fromtimestamp(heartbeat.stat().st_mtime).isoformat() if heartbeat.exists() else None
-    details = {}
-    if heartbeat.exists():
-        try:
-            details = json.loads(heartbeat.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            details = {}
-    return {"active": active, "status": "LIVE" if active else "OFFLINE", "last_heartbeat": last_heartbeat, "camera_ip": details.get("camera_ip", "Mencari kamera"), "stream": details.get("stream", "—"), "mode": details.get("mode", "Background")}
+def counter_status(session: Session = Depends(get_session)):
+    device_id = configured_device_id()
+    device = session.get(EdgeDeviceState, device_id)
+    last_seen = as_utc(device.last_seen_at) if device else None
+    active = bool(last_seen and utc_now() - last_seen <= timedelta(seconds=15))
+    camera_status = "connected" if device and device.camera_ip else "—"
+    return {
+        "active": active,
+        "status": "LIVE" if active else "OFFLINE",
+        "last_heartbeat": last_seen.isoformat() if last_seen else None,
+        "camera_ip": device.camera_ip if device and ENVIRONMENT != "production" else camera_status,
+        "stream": device.stream if device else "—",
+        "mode": device.mode if device else "Edge",
+    }
 
 
 @app.post("/api/admin/counter/reset")
-def reset_counter(request: Request):
+def reset_counter(request: Request, session: Session = Depends(get_session)):
     if not valid_admin_session(request.cookies.get(SESSION_COOKIE)):
         raise HTTPException(status_code=401, detail="Sesi admin tidak aktif")
 
-    today = date.today().isoformat()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with get_connection() as conn:
-        conn.execute("DELETE FROM visitor_events WHERE event_date = ?", (today,))
-        conn.execute(
-            "UPDATE counter_state SET occupancy = 0, updated_at = ? WHERE id = 1",
-            (timestamp,),
-        )
-        conn.commit()
+    device_id = configured_device_id()
+    today = datetime.now(WIB).date()
+    start_utc, end_utc = wib_day_bounds(today)
 
-    (BASE_DIR / "counter_reset.request").write_text(timestamp, encoding="utf-8")
-    return {"reset": True, "date": today, "inside": 0, "today_in": 0, "today_out": 0}
+    (
+        session.query(VisitorEvent)
+        .filter(
+            VisitorEvent.device_id == device_id,
+            VisitorEvent.occurred_at >= start_utc,
+            VisitorEvent.occurred_at < end_utc,
+        )
+        .delete(synchronize_session=False)
+    )
+
+    now = utc_now()
+    counter = session.get(CounterState, device_id)
+    if counter is None:
+        counter = CounterState(device_id=device_id, occupancy=0, updated_at=now)
+        session.add(counter)
+    else:
+        counter.occupancy = 0
+        counter.updated_at = now
+
+    pending_reset = (
+        session.query(DeviceCommand)
+        .filter(
+            DeviceCommand.device_id == device_id,
+            DeviceCommand.command == "RESET_COUNTER",
+            DeviceCommand.acknowledged_at.is_(None),
+        )
+        .first()
+    )
+    if pending_reset is None:
+        session.add(
+            DeviceCommand(
+                device_id=device_id,
+                command="RESET_COUNTER",
+                payload_json=json.dumps({"requested_at": now.isoformat()}),
+            )
+        )
+
+    session.commit()
+    return {
+        "reset": True,
+        "date": today.isoformat(),
+        "inside": 0,
+        "today_in": 0,
+        "today_out": 0,
+    }
 
 
 @app.get("/api/lab/status")
@@ -242,77 +493,70 @@ def root():
 
 
 @app.get("/api/visitors")
-def visitors():
-    today = date.today().isoformat()
+def visitors(session: Session = Depends(get_session)):
+    device_id = configured_device_id()
+    today = datetime.now(WIB).date()
+    start_utc, end_utc = wib_day_bounds(today)
 
-    with get_connection() as conn:
-        totals = conn.execute(
-            """
-            SELECT
-                COALESCE(SUM(CASE WHEN direction = 'IN' THEN 1 ELSE 0 END), 0) AS today_in,
-                COALESCE(SUM(CASE WHEN direction = 'OUT' THEN 1 ELSE 0 END), 0) AS today_out
-            FROM visitor_events
-            WHERE event_date = ?
-            """,
-            (today,),
-        ).fetchone()
-
-        state = conn.execute(
-            """
-            SELECT occupancy, updated_at
-            FROM counter_state
-            WHERE id = 1
-            """
-        ).fetchone()
-
-        last_event = conn.execute(
-            """
-            SELECT direction, timestamp
-            FROM visitor_events
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
+    today_in = (
+        session.query(VisitorEvent.id)
+        .filter(
+            VisitorEvent.device_id == device_id,
+            VisitorEvent.occurred_at >= start_utc,
+            VisitorEvent.occurred_at < end_utc,
+            VisitorEvent.direction == "IN",
+        )
+        .count()
+    )
+    today_out = (
+        session.query(VisitorEvent.id)
+        .filter(
+            VisitorEvent.device_id == device_id,
+            VisitorEvent.occurred_at >= start_utc,
+            VisitorEvent.occurred_at < end_utc,
+            VisitorEvent.direction == "OUT",
+        )
+        .count()
+    )
+    state = session.get(CounterState, device_id)
+    last_event = (
+        session.query(VisitorEvent)
+        .filter(VisitorEvent.device_id == device_id)
+        .order_by(VisitorEvent.occurred_at.desc(), VisitorEvent.id.desc())
+        .first()
+    )
 
     return {
-        "date": today,
-        "today_in": int(totals["today_in"]),
-        "today_out": int(totals["today_out"]),
-        "inside": int(state["occupancy"]) if state else 0,
-        "last_event": last_event["direction"] if last_event else None,
-        "last_event_time": last_event["timestamp"] if last_event else None,
-        "updated_at": state["updated_at"] if state else None,
+        "date": today.isoformat(),
+        "today_in": int(today_in),
+        "today_out": int(today_out),
+        "inside": int(state.occupancy) if state else 0,
+        "last_event": last_event.direction if last_event else None,
+        "last_event_time": last_event.occurred_at.isoformat() if last_event else None,
+        "updated_at": state.updated_at.isoformat() if state else None,
     }
 
 
 @app.get("/api/visitors/recent")
-def recent_visitors(limit: int = 20):
+def recent_visitors(limit: int = 20, session: Session = Depends(get_session)):
     limit = max(1, min(limit, 100))
-
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                id,
-                timestamp,
-                track_id,
-                direction,
-                occupancy_after
-            FROM visitor_events
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+    device_id = configured_device_id()
+    rows = (
+        session.query(VisitorEvent)
+        .filter(VisitorEvent.device_id == device_id)
+        .order_by(VisitorEvent.occurred_at.desc(), VisitorEvent.id.desc())
+        .limit(limit)
+        .all()
+    )
 
     return {
         "events": [
             {
-                "id": row["id"],
-                "timestamp": row["timestamp"],
-                "track_id": row["track_id"],
-                "direction": row["direction"],
-                "occupancy_after": row["occupancy_after"],
+                "id": row.id,
+                "timestamp": row.occurred_at.isoformat(),
+                "track_id": row.track_id,
+                "direction": row.direction,
+                "occupancy_after": row.occupancy_after,
             }
             for row in rows
         ]
@@ -511,6 +755,8 @@ def my_requests(
     user: CurrentUser = Depends(current_user),
     session: Session = Depends(get_session),
 ):
+    if user.role == "GUEST":
+        return []
     items = list_requests(session, requester_id=user.user_id, request_type=request_type)
     return [request_to_dict(item) for item in items]
 
@@ -521,9 +767,11 @@ def create_request(
     user: CurrentUser = Depends(current_user),
     session: Session = Depends(get_session),
 ):
+    if user.role == "GUEST":
+        raise HTTPException(status_code=403, detail="Login dengan email UII diperlukan untuk membuat pengajuan")
     validate_request(payload, session)
     item = ServiceRequest(
-        request_code=f"{payload.request_type[:3]}-{datetime.now():%y%m%d}-{uuid4().hex[:6].upper()}",
+        request_code=f"{payload.request_type[:3]}-{datetime.now(WIB):%y%m%d}-{uuid4().hex[:6].upper()}",
         request_type=payload.request_type,
         requester_name=user.name,
         requester_id=user.user_id,
@@ -568,12 +816,12 @@ async def upload_request_file(
     content = await upload.read(20 * 1024 * 1024 + 1)
     if len(content) > 20 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Ukuran file maksimal 20 MB")
-    folder = UPLOAD_DIR / item.request_type.lower() / datetime.now().strftime("%Y/%m")
+    folder = UPLOAD_DIR / item.request_type.lower() / datetime.now(WIB).strftime("%Y/%m")
     folder.mkdir(parents=True, exist_ok=True)
     safe_name = f"{item.request_code}_{uuid4().hex[:8]}{extension}"
     path = folder / safe_name
     path.write_bytes(content)
-    item.file_path = str(path.relative_to(BASE_DIR))
+    item.file_path = str(path.relative_to(UPLOAD_DIR.parent)) if path.is_relative_to(UPLOAD_DIR.parent) else str(path)
     session.commit()
     session.refresh(item)
     return request_to_dict(item)
@@ -604,6 +852,8 @@ def visible_notifications_query(session: Session, user: CurrentUser):
     query = session.query(Notification)
     if user.role in {"LABORAN", "ADMIN"}:
         return query.filter(Notification.recipient_role == "LABORAN")
+    if user.role == "GUEST":
+        return query.filter(Notification.id < 0)
     return query.filter(Notification.recipient_user_id == user.user_id)
 
 
@@ -702,8 +952,6 @@ def update_request_status(
     return request_to_dict(item)
 
 
-# Hasil build React dilayani oleh proses FastAPI yang sama. Mount dilakukan
-# setelah route API agar /api/* tidak pernah tertangkap oleh frontend.
 if FRONTEND_DIST.exists():
     assets_dir = FRONTEND_DIST / "assets"
     if assets_dir.exists():
