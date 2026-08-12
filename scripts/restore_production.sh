@@ -27,8 +27,10 @@ cat "$SOURCE/labhub.dump" | docker compose exec -T db pg_restore -U labhub -d la
 
 echo "[4/5] Restore uploads..."
 if [ -d "$SOURCE/uploads" ]; then
-  docker compose exec -T app sh -c 'rm -rf /data/uploads/* && mkdir -p /data/uploads' || true
-  docker compose cp "$SOURCE/uploads/." app:/data/uploads/
+  UPLOAD_SOURCE="$(cd "$SOURCE/uploads" && pwd)"
+  docker compose run --rm --no-deps \
+    -v "$UPLOAD_SOURCE:/restore:ro" \
+    app sh -c 'rm -rf /data/uploads/* /data/uploads/.[!.]* /data/uploads/..?* 2>/dev/null || true; cp -a /restore/. /data/uploads/'
 fi
 
 echo "[5/5] Jalankan aplikasi kembali..."
