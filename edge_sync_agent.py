@@ -112,11 +112,16 @@ def get_local_connection():
     return conn
 
 
-def max_local_event_id():
+def local_event_sequence():
     conn = get_local_connection()
     if conn is None:
         return 0
     try:
+        sequence = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'visitor_events'"
+        ).fetchone()
+        if sequence:
+            return int(sequence["seq"])
         row = conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM visitor_events").fetchone()
         return int(row["max_id"]) if row else 0
     except sqlite3.OperationalError:
@@ -126,11 +131,11 @@ def max_local_event_id():
 
 
 def reconcile_state(state):
-    max_id = max_local_event_id()
-    if max_id < state["last_synced_id"]:
+    sequence = local_event_sequence()
+    if sequence < state["last_synced_id"]:
         logger.warning(
-            "Database lokal tampak dibuat ulang (max_id=%s < last_synced_id=%s). Reset pointer sync ke 0.",
-            max_id,
+            "Database lokal tampak dibuat ulang (sequence=%s < last_synced_id=%s). Reset pointer sync ke 0.",
+            sequence,
             state["last_synced_id"],
         )
         state["last_synced_id"] = 0
@@ -148,6 +153,23 @@ def local_occupancy():
         return max(0, int(row["occupancy"])) if row else 0
     except sqlite3.OperationalError:
         return 0
+    finally:
+        conn.close()
+
+
+def reset_local_today():
+    conn = get_local_connection()
+    if conn is None:
+        return
+    today = datetime.now(WIB).date().isoformat()
+    timestamp = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        conn.execute("DELETE FROM visitor_events WHERE event_date = ?", (today,))
+        conn.execute(
+            "UPDATE counter_state SET occupancy = 0, updated_at = ? WHERE id = 1",
+            (timestamp,),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -243,17 +265,34 @@ def send_heartbeat():
     request_json("POST", "/api/edge/heartbeat", heartbeat_payload())
 
 
+def apply_reset_command(command_id):
+    # Clear the local persistence synchronously BEFORE event sync resumes. This
+    # prevents unsynced pre-reset rows from being uploaded after the cloud reset.
+    reset_local_today()
+    RESET_REQUEST_FILE.write_text(
+        datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S"),
+        encoding="utf-8",
+    )
+
+    # Give the live counter a short chance to consume the request and reset its
+    # in-memory counters. If it is offline, the request file remains for startup.
+    deadline = time.monotonic() + 5
+    while RESET_REQUEST_FILE.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+    # Clear again to close the small race window between the first transaction
+    # and the counter consuming the reset request.
+    reset_local_today()
+    logger.info("Command RESET_COUNTER #%s diterapkan pada database lokal.", command_id)
+
+
 def process_commands():
     result = request_json("GET", "/api/edge/commands")
     for command in result.get("commands", []):
         command_id = int(command["id"])
         command_name = str(command.get("command", "")).upper()
         if command_name == "RESET_COUNTER":
-            RESET_REQUEST_FILE.write_text(
-                datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S"),
-                encoding="utf-8",
-            )
-            logger.info("Command RESET_COUNTER #%s diteruskan ke visitor counter.", command_id)
+            apply_reset_command(command_id)
         else:
             logger.warning("Command #%s tidak dikenal: %s", command_id, command_name)
         request_json("POST", f"/api/edge/commands/{command_id}/ack", {})
@@ -270,6 +309,12 @@ def main():
     while True:
         now = time.monotonic()
         try:
+            # Commands run first so a queued RESET_COUNTER is applied before any
+            # locally buffered pre-reset events are considered for upload.
+            if now - last_command_check >= COMMAND_INTERVAL:
+                process_commands()
+                last_command_check = time.monotonic()
+
             synced = sync_events(state)
             if synced:
                 now = time.monotonic()
@@ -277,10 +322,6 @@ def main():
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 send_heartbeat()
                 last_heartbeat = now
-
-            if now - last_command_check >= COMMAND_INTERVAL:
-                process_commands()
-                last_command_check = now
 
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
