@@ -1,9 +1,13 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from labhub.database import Base
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Equipment(Base):
@@ -91,3 +95,50 @@ class Notification(Base):
     request_id: Mapped[int | None] = mapped_column(ForeignKey("service_requests.id", ondelete="SET NULL"), nullable=True, index=True)
     read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+
+class VisitorEvent(Base):
+    __tablename__ = "visitor_events_cloud"
+    __table_args__ = (
+        CheckConstraint("direction IN ('IN', 'OUT')", name="ck_visitor_event_direction"),
+        CheckConstraint("occupancy_after >= 0", name="ck_visitor_event_occupancy_nonnegative"),
+        UniqueConstraint("event_uuid", name="uq_visitor_event_uuid"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_uuid: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    device_id: Mapped[str] = mapped_column(String(80), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    track_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    direction: Mapped[str] = mapped_column(String(8), index=True)
+    occupancy_after: Mapped[int] = mapped_column(Integer)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class CounterState(Base):
+    __tablename__ = "counter_states"
+
+    device_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    occupancy: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class EdgeDeviceState(Base):
+    __tablename__ = "edge_device_states"
+
+    device_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    camera_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    stream: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    mode: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class DeviceCommand(Base):
+    __tablename__ = "device_commands"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    device_id: Mapped[str] = mapped_column(String(80), index=True)
+    command: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
