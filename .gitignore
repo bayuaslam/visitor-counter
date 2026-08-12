@@ -9,21 +9,33 @@ __pycache__/
 
 # Environment / secrets
 .env
+.env.*
+!.env.example
 camera_password.dpapi
 
 # Logs
 *.log
+network-recovery.log
 
 # Runtime data
 captures/
 storage/
+counter_heartbeat
+counter_reset.request
+detection_log.csv
+visitor_events.csv
 
 # SQLite runtime files
-*.db-shm
-*.db-wal
-
-# Optional: jangan upload database lokal
 *.db
+*.db-*
+*.db-journal
+
+# Frontend generated dependencies/build
+frontend/node_modules/
+frontend/dist/
+
+# Local Windows launcher binary
+SmartLab.exe
 
 # Temporary files
 *.tmp
