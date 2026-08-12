@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
@@ -6,8 +6,15 @@ from sqlalchemy.orm import Mapped, mapped_column
 from labhub.database import Base
 
 
+WIB = timezone(timedelta(hours=7))
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def jakarta_now_naive() -> datetime:
+    return datetime.now(WIB).replace(tzinfo=None)
 
 
 class Equipment(Base):
@@ -31,11 +38,11 @@ class Equipment(Base):
     location: Mapped[str] = mapped_column(String(160), default="")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     photo_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.now,
-        onupdate=datetime.now,
+        default=jakarta_now_naive,
+        onupdate=jakarta_now_naive,
     )
 
 
@@ -45,7 +52,19 @@ class StudentUser(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(190), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(300))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive)
+
+
+class PendingRegistration(Base):
+    __tablename__ = "pending_registrations"
+
+    email: Mapped[str] = mapped_column(String(190), primary_key=True)
+    password_hash: Mapped[str] = mapped_column(String(300))
+    code_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    last_sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
 class LabSetting(Base):
@@ -53,7 +72,7 @@ class LabSetting(Base):
 
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[str] = mapped_column(String(200))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive, onupdate=jakarta_now_naive)
 
 
 class ServiceRequest(Base):
@@ -79,8 +98,8 @@ class ServiceRequest(Base):
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     admin_note: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive, onupdate=jakarta_now_naive)
 
 
 class Notification(Base):
@@ -94,7 +113,7 @@ class Notification(Base):
     message: Mapped[str] = mapped_column(Text)
     request_id: Mapped[int | None] = mapped_column(ForeignKey("service_requests.id", ondelete="SET NULL"), nullable=True, index=True)
     read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=jakarta_now_naive, index=True)
 
 
 class VisitorEvent(Base):
