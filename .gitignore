@@ -1,0 +1,36 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment / secrets
+.env
+camera_password.dpapi
+
+# Logs
+*.log
+
+# Runtime data
+captures/
+storage/
+
+# SQLite runtime files
+*.db-shm
+*.db-wal
+
+# Optional: jangan upload database lokal
+*.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
