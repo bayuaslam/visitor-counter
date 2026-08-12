@@ -109,9 +109,15 @@ def test_edge_event_sync_is_idempotent_and_updates_dashboard(client):
             "stream": "ch1/sub",
             "mode": "Background",
             "occupancy": 1,
+            "counter_active": True,
         },
     )
     assert heartbeat.status_code == 200
+
+    status = client.get("/api/counter/status")
+    assert status.status_code == 200
+    assert status.json()["edge_connected"] is True
+    assert status.json()["active"] is True
 
     occurred = datetime.now(timezone(timedelta(hours=7))).replace(microsecond=0).isoformat()
     payload = {
@@ -142,6 +148,16 @@ def test_edge_event_sync_is_idempotent_and_updates_dashboard(client):
     recent = client.get("/api/visitors/recent?limit=5")
     assert recent.status_code == 200
     assert recent.json()["events"][0]["direction"] == "IN"
+
+    stopped = client.post(
+        "/api/edge/heartbeat",
+        headers=EDGE_HEADERS,
+        json={"occupancy": 1, "counter_active": False},
+    )
+    assert stopped.status_code == 200
+    stopped_status = client.get("/api/counter/status").json()
+    assert stopped_status["edge_connected"] is True
+    assert stopped_status["active"] is False
 
 
 def test_admin_reset_queues_edge_command(client):
