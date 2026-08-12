@@ -1,0 +1,67 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: labhub
+      POSTGRES_USER: labhub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U labhub -d labhub"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      LABHUB_ENV: production
+      LABHUB_COOKIE_SECURE: "1"
+      LABHUB_TRUST_PROXY: "1"
+      LABHUB_ALLOWED_HOSTS: ${LABHUB_DOMAIN}
+      LABHUB_ALLOWED_ORIGINS: https://${LABHUB_DOMAIN}
+      DATABASE_URL: postgresql+psycopg://labhub:${POSTGRES_PASSWORD}@db:5432/labhub
+      LABHUB_UPLOAD_DIR: /data/uploads
+      LABHUB_SESSION_SECRET: ${LABHUB_SESSION_SECRET}
+      LABHUB_ADMIN_PASSWORD_HASH: ${LABHUB_ADMIN_PASSWORD_HASH}
+      LABHUB_EDGE_DEVICE_ID: ${LABHUB_EDGE_DEVICE_ID:-lab-robotika-01}
+      LABHUB_EDGE_DEVICE_TOKEN: ${LABHUB_EDGE_DEVICE_TOKEN}
+      LABHUB_SMTP_HOST: ${LABHUB_SMTP_HOST}
+      LABHUB_SMTP_PORT: ${LABHUB_SMTP_PORT:-587}
+      LABHUB_SMTP_USERNAME: ${LABHUB_SMTP_USERNAME}
+      LABHUB_SMTP_PASSWORD: ${LABHUB_SMTP_PASSWORD}
+      LABHUB_SMTP_FROM: ${LABHUB_SMTP_FROM}
+      LABHUB_SMTP_SSL: ${LABHUB_SMTP_SSL:-0}
+      LABHUB_SMTP_STARTTLS: ${LABHUB_SMTP_STARTTLS:-1}
+    volumes:
+      - uploads_data:/data/uploads
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      LABHUB_DOMAIN: ${LABHUB_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  uploads_data:
+  caddy_data:
+  caddy_config:
