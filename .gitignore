@@ -24,6 +24,7 @@ counter_heartbeat
 counter_reset.request
 detection_log.csv
 visitor_events.csv
+edge_sync_state.json
 
 # SQLite runtime files
 *.db
