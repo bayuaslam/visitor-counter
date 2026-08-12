@@ -32,7 +32,7 @@ Requirements: a Linux server/VPS, Docker Engine + Docker Compose, a DNS hostname
 
 1. Check out this branch on the server.
 2. Copy `.env.production.example` to `.env`.
-3. Generate secrets with `python scripts/generate_production_secrets.py` and copy the generated values into `.env`.
+3. Generate secrets with `python scripts/generate_production_secrets.py` and copy the generated values into `.env`. Keep `LABHUB_ADMIN_PASSWORD_HASH` single-quoted; the hash contains `$` delimiters that must not be interpreted by Docker Compose.
 4. Set `LABHUB_DOMAIN` and SMTP values in `.env`.
 5. Start the stack:
 
@@ -52,16 +52,22 @@ Caddy obtains and renews TLS automatically when DNS and ports 80/443 are reachab
 
 ## Existing SQLite data migration
 
-Before switching users to the online server, copy `labhub.db` and `lab_visitors.db` from the old PC to a protected migration working directory. Point `DATABASE_URL` at the target PostgreSQL database and run a dry-run first:
+Before switching users to the online server, copy `labhub.db` and `lab_visitors.db` from the old PC into a protected directory on the production host. The migration utility is included in the app image and therefore receives the same PostgreSQL environment as the server.
+
+Dry-run first:
 
 ```sh
-python scripts/migrate_sqlite_to_postgres.py \
-  --labhub-db /secure/path/labhub.db \
-  --visitors-db /secure/path/lab_visitors.db \
+docker compose run --rm --no-deps \
+  -v /secure/migration:/migration:ro \
+  app python scripts/migrate_sqlite_to_postgres.py \
+  --labhub-db /migration/labhub.db \
+  --visitors-db /migration/lab_visitors.db \
   --dry-run
 ```
 
-Then repeat without `--dry-run`. The importer is idempotent for normal reruns and preserves legacy request/equipment identifiers. If old `storage/uploads` contains user files, copy those files separately into the production upload volume after the database migration.
+If the counts are correct, repeat the same command without `--dry-run`. The importer is idempotent for normal reruns and preserves legacy request/equipment identifiers.
+
+If old `storage/uploads` contains user files, copy those files separately into the production upload volume after the database migration. Do not place migration database files inside the Git repository.
 
 ## Lab edge PC
 
