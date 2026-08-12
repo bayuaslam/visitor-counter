@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from labhub.database import Base
@@ -149,6 +149,7 @@ class EdgeDeviceState(Base):
     camera_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     stream: Mapped[str | None] = mapped_column(String(120), nullable=True)
     mode: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    counter_active: Mapped[bool] = mapped_column(Boolean, default=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
