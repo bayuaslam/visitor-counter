@@ -1,23 +1,29 @@
 from pathlib import Path
+import hmac
 import json
 import os
 import re
+import secrets
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi import Depends, File, Form, Query, UploadFile
+from fastapi import Depends, File, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 
 from labhub.auth import CurrentUser, SESSION_COOKIE, STUDENT_SESSION_COOKIE, create_admin_session, create_guest_session, create_student_session, current_user, hash_password, student_session, valid_admin_session, verify_admin_password, verify_password
-from labhub.database import get_session, init_database
+from labhub.database import DATABASE_URL, get_session, init_database
 from labhub.edge_auth import configured_device_id, require_edge_device
-from labhub.models import CounterState, DeviceCommand, EdgeDeviceState, Equipment, LabSetting, Notification, ServiceRequest, StudentUser, VisitorEvent
+from labhub.email_verification import code_digest, send_verification_email
+from labhub.models import CounterState, DeviceCommand, EdgeDeviceState, Equipment, LabSetting, Notification, PendingRegistration, ServiceRequest, StudentUser, VisitorEvent
+from labhub.rate_limit import enforce_rate_limit
 from labhub.repositories.equipment import equipment_summary, list_equipment
 from labhub.repositories.requests import list_requests, request_counts, request_to_dict, room_has_overlap
 from labhub.schemas import EquipmentCreate, EquipmentItem, EquipmentList, EquipmentSummary, EquipmentUpdate, ServiceRequestCreate, ServiceRequestItem, StatusUpdate
@@ -33,10 +39,6 @@ COOKIE_SECURE = os.getenv(
     "LABHUB_COOKIE_SECURE",
     "1" if ENVIRONMENT == "production" else "0",
 ).strip() == "1"
-ALLOW_UNVERIFIED_REGISTRATION = os.getenv(
-    "LABHUB_ALLOW_UNVERIFIED_REGISTRATION",
-    "0" if ENVIRONMENT == "production" else "1",
-).strip() == "1"
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -45,6 +47,14 @@ ALLOWED_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv(
+        "LABHUB_ALLOWED_HOSTS",
+        "localhost,127.0.0.1,testserver" if ENVIRONMENT != "production" else "",
+    ).split(",")
+    if host.strip()
+]
 
 app = FastAPI(
     title="Lab Robotika Visitor API",
@@ -52,10 +62,8 @@ app = FastAPI(
 )
 
 
-@app.on_event("startup")
-def startup():
-    init_database()
-
+if ALLOWED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,6 +79,24 @@ app.add_middleware(
         "X-LabHub-Device-Token",
     ],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; "
+        "img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; connect-src 'self'",
+    )
+    if ENVIRONMENT == "production":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 
 def utc_now() -> datetime:
@@ -92,6 +118,36 @@ def wib_day_bounds(target_date: date | None = None) -> tuple[datetime, datetime]
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
+def validate_production_config() -> None:
+    if ENVIRONMENT != "production":
+        return
+
+    problems = []
+    if DATABASE_URL.startswith("sqlite:"):
+        problems.append("DATABASE_URL production harus PostgreSQL")
+    if len(os.getenv("LABHUB_SESSION_SECRET", "")) < 32:
+        problems.append("LABHUB_SESSION_SECRET minimal 32 karakter")
+    if not os.getenv("LABHUB_ADMIN_PASSWORD_HASH", "").startswith("pbkdf2_sha256$"):
+        problems.append("LABHUB_ADMIN_PASSWORD_HASH belum valid")
+    if len(os.getenv("LABHUB_EDGE_DEVICE_TOKEN", "")) < 24:
+        problems.append("LABHUB_EDGE_DEVICE_TOKEN minimal 24 karakter")
+    if not COOKIE_SECURE:
+        problems.append("LABHUB_COOKIE_SECURE harus 1")
+    if not ALLOWED_HOSTS or "*" in ALLOWED_HOSTS:
+        problems.append("LABHUB_ALLOWED_HOSTS wajib berisi hostname production")
+    if not os.getenv("LABHUB_SMTP_HOST", "").strip() or not os.getenv("LABHUB_SMTP_FROM", "").strip():
+        problems.append("SMTP wajib dikonfigurasi untuk verifikasi email UII")
+
+    if problems:
+        raise RuntimeError("Konfigurasi production belum aman: " + "; ".join(problems))
+
+
+@app.on_event("startup")
+def startup():
+    validate_production_config()
+    init_database()
+
+
 class AdminLoginPayload(BaseModel):
     password: str
 
@@ -99,6 +155,11 @@ class AdminLoginPayload(BaseModel):
 class StudentAuthPayload(BaseModel):
     email: str
     password: str
+
+
+class RegistrationVerifyPayload(BaseModel):
+    email: str
+    code: str
 
 
 class LabStatusPayload(BaseModel):
@@ -125,7 +186,8 @@ class EdgeVisitorEventBatch(BaseModel):
 
 
 @app.post("/api/admin/login")
-def admin_login(payload: AdminLoginPayload, response: Response):
+def admin_login(payload: AdminLoginPayload, response: Response, request: Request):
+    enforce_rate_limit(request, "admin-login", 5, 60)
     if not verify_admin_password(payload.password):
         raise HTTPException(status_code=401, detail="Password salah")
     token, max_age = create_admin_session()
@@ -175,27 +237,100 @@ def set_student_cookie(response: Response, email: str):
     )
 
 
-@app.post("/api/auth/register", status_code=201)
-def student_register(payload: StudentAuthPayload, response: Response, session: Session = Depends(get_session)):
-    if not ALLOW_UNVERIFIED_REGISTRATION:
-        raise HTTPException(
-            status_code=503,
-            detail="Registrasi production dinonaktifkan sampai verifikasi email UII/SSO diaktifkan",
-        )
+@app.post("/api/auth/register", status_code=202)
+def student_register(
+    payload: StudentAuthPayload,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    enforce_rate_limit(request, "student-register", 3, 600)
     email = normalized_uii_email(payload.email)
     if len(payload.password) < 8:
         raise HTTPException(status_code=422, detail="Password minimal 8 karakter")
     if session.query(StudentUser).filter(StudentUser.email == email).first():
         raise HTTPException(status_code=409, detail="Email sudah terdaftar")
-    user = StudentUser(email=email, password_hash=hash_password(payload.password))
+
+    now = utc_now()
+    pending = session.get(PendingRegistration, email)
+    if pending and as_utc(pending.last_sent_at) and now - as_utc(pending.last_sent_at) < timedelta(seconds=60):
+        raise HTTPException(status_code=429, detail="Tunggu 60 detik sebelum meminta kode baru")
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    if pending is None:
+        pending = PendingRegistration(email=email)
+        session.add(pending)
+    pending.password_hash = hash_password(payload.password)
+    pending.code_hash = code_digest(email, code)
+    pending.expires_at = now + timedelta(minutes=10)
+    pending.attempts = 0
+    pending.last_sent_at = now
+
+    try:
+        session.flush()
+        send_verification_email(email, code)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=503, detail="Kode verifikasi belum dapat dikirim") from exc
+
+    return {
+        "verification_required": True,
+        "email": email,
+        "expires_in": 600,
+    }
+
+
+@app.post("/api/auth/register/verify", status_code=201)
+def verify_student_registration(
+    payload: RegistrationVerifyPayload,
+    response: Response,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    enforce_rate_limit(request, "student-register-verify", 10, 600)
+    email = normalized_uii_email(payload.email)
+    code = payload.code.strip()
+    if not re.fullmatch(r"\d{6}", code):
+        raise HTTPException(status_code=422, detail="Kode verifikasi harus 6 digit")
+
+    pending = session.get(PendingRegistration, email)
+    if not pending:
+        raise HTTPException(status_code=404, detail="Permintaan verifikasi tidak ditemukan")
+    if as_utc(pending.expires_at) <= utc_now():
+        session.delete(pending)
+        session.commit()
+        raise HTTPException(status_code=410, detail="Kode verifikasi sudah kedaluwarsa")
+    if pending.attempts >= 5:
+        session.delete(pending)
+        session.commit()
+        raise HTTPException(status_code=429, detail="Terlalu banyak percobaan. Minta kode baru")
+
+    if not hmac.compare_digest(pending.code_hash, code_digest(email, code)):
+        pending.attempts += 1
+        session.commit()
+        raise HTTPException(status_code=400, detail="Kode verifikasi salah")
+
+    if session.query(StudentUser).filter(StudentUser.email == email).first():
+        session.delete(pending)
+        session.commit()
+        raise HTTPException(status_code=409, detail="Email sudah terdaftar")
+
+    user = StudentUser(email=email, password_hash=pending.password_hash)
     session.add(user)
+    session.delete(pending)
     session.commit()
     set_student_cookie(response, email)
     return {"authenticated": True, "email": email}
 
 
 @app.post("/api/auth/login")
-def student_login(payload: StudentAuthPayload, response: Response, session: Session = Depends(get_session)):
+def student_login(
+    payload: StudentAuthPayload,
+    response: Response,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    enforce_rate_limit(request, "student-login", 10, 60)
     email = normalized_uii_email(payload.email)
     user = session.query(StudentUser).filter(StudentUser.email == email).first()
     if not user or not verify_password(payload.password, user.password_hash):
@@ -205,7 +340,8 @@ def student_login(payload: StudentAuthPayload, response: Response, session: Sess
 
 
 @app.post("/api/auth/guest")
-def guest_login(response: Response):
+def guest_login(response: Response, request: Request):
+    enforce_rate_limit(request, "guest-session", 30, 60)
     token, max_age = create_guest_session()
     response.set_cookie(
         STUDENT_SESSION_COOKIE,
@@ -227,7 +363,7 @@ def student_auth_session(request: Request, session: Session = Depends(get_sessio
     user = session.query(StudentUser).filter(StudentUser.email == data.get("sub")).first() if data else None
     if not user:
         raise HTTPException(status_code=401, detail="Sesi mahasiswa tidak aktif")
-    return {"authenticated": True, "email": user.email}
+    return {"authenticated": True, "email": user.email, "guest": False}
 
 
 @app.post("/api/auth/logout")
@@ -237,7 +373,8 @@ def student_logout(response: Response):
 
 
 @app.get("/api/health")
-def health():
+def health(session: Session = Depends(get_session)):
+    session.execute(text("SELECT 1"))
     return {
         "status": "ok",
         "service": "Lab Robotika Visitor API",
@@ -479,7 +616,7 @@ def update_lab_status(payload: LabStatusPayload, request: Request, session: Sess
         session.add(setting)
     else:
         setting.value = "OPEN" if payload.is_open else "CLOSED"
-        setting.updated_at = datetime.now()
+        setting.updated_at = datetime.now(WIB).replace(tzinfo=None)
     session.commit()
     session.refresh(setting)
     return {"is_open": payload.is_open, "status": setting.value, "updated_at": setting.updated_at.isoformat()}
@@ -489,7 +626,7 @@ def update_lab_status(payload: LabStatusPayload, request: Request, session: Sess
 def root():
     if FRONTEND_DIST.exists():
         return FileResponse(FRONTEND_DIST / "index.html")
-    return health()
+    return {"status": "ok", "service": "Lab Robotika Visitor API"}
 
 
 @app.get("/api/visitors")
@@ -764,9 +901,11 @@ def my_requests(
 @app.post("/api/requests", response_model=ServiceRequestItem, status_code=201)
 def create_request(
     payload: ServiceRequestCreate,
+    request: Request,
     user: CurrentUser = Depends(current_user),
     session: Session = Depends(get_session),
 ):
+    enforce_rate_limit(request, "service-request", 20, 3600)
     if user.role == "GUEST":
         raise HTTPException(status_code=403, detail="Login dengan email UII diperlukan untuk membuat pengajuan")
     validate_request(payload, session)
@@ -803,9 +942,14 @@ def create_request(
 async def upload_request_file(
     request_id: int,
     upload: UploadFile = File(...),
+    request: Request = None,
     user: CurrentUser = Depends(current_user),
     session: Session = Depends(get_session),
 ):
+    if request is not None:
+        enforce_rate_limit(request, "service-upload", 30, 3600)
+    if user.role == "GUEST":
+        raise HTTPException(status_code=403, detail="Login dengan email UII diperlukan")
     item = session.get(ServiceRequest, request_id)
     if not item or (item.requester_id != user.user_id and user.role not in {"LABORAN", "ADMIN"}):
         raise HTTPException(status_code=404, detail="Request tidak ditemukan")
@@ -893,7 +1037,7 @@ def read_notification(
     if not item:
         raise HTTPException(status_code=404, detail="Notifikasi tidak ditemukan")
     if item.read_at is None:
-        item.read_at = datetime.now()
+        item.read_at = datetime.now(WIB).replace(tzinfo=None)
         session.commit()
     return {"status": "ok"}
 
@@ -904,7 +1048,7 @@ def read_all_notifications(
     session: Session = Depends(get_session),
 ):
     updated = visible_notifications_query(session, user).filter(Notification.read_at.is_(None)).update(
-        {Notification.read_at: datetime.now()},
+        {Notification.read_at: datetime.now(WIB).replace(tzinfo=None)},
         synchronize_session=False,
     )
     session.commit()
