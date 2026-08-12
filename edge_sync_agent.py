@@ -48,7 +48,6 @@ DEVICE_ID = os.getenv("LABHUB_EDGE_DEVICE_ID", "lab-robotika-01").strip()
 DEVICE_TOKEN = os.getenv("LABHUB_EDGE_DEVICE_TOKEN", "")
 SYNC_INTERVAL = max(1.0, float(os.getenv("LABHUB_EDGE_SYNC_INTERVAL", "2")))
 HEARTBEAT_INTERVAL = max(2.0, float(os.getenv("LABHUB_EDGE_HEARTBEAT_INTERVAL", "5")))
-COMMAND_INTERVAL = max(2.0, float(os.getenv("LABHUB_EDGE_COMMAND_INTERVAL", "5")))
 
 
 def require_config():
@@ -266,8 +265,8 @@ def send_heartbeat():
 
 
 def apply_reset_command(command_id):
-    # Clear the local persistence synchronously BEFORE event sync resumes. This
-    # prevents unsynced pre-reset rows from being uploaded after the cloud reset.
+    # Clear persistence synchronously before event sync can resume. This prevents
+    # unsynced pre-reset rows from being uploaded after a cloud-side reset.
     reset_local_today()
     RESET_REQUEST_FILE.write_text(
         datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S"),
@@ -275,7 +274,7 @@ def apply_reset_command(command_id):
     )
 
     # Give the live counter a short chance to consume the request and reset its
-    # in-memory counters. If it is offline, the request file remains for startup.
+    # in-memory counters. If it is offline, the request remains for startup.
     deadline = time.monotonic() + 5
     while RESET_REQUEST_FILE.exists() and time.monotonic() < deadline:
         time.sleep(0.1)
@@ -302,18 +301,16 @@ def main():
     require_config()
     state = load_state()
     last_heartbeat = 0.0
-    last_command_check = 0.0
 
     logger.info("SmartLab Edge Sync aktif. server=%s device=%s", SERVER_URL, DEVICE_ID)
 
     while True:
         now = time.monotonic()
         try:
-            # Commands run first so a queued RESET_COUNTER is applied before any
-            # locally buffered pre-reset events are considered for upload.
-            if now - last_command_check >= COMMAND_INTERVAL:
-                process_commands()
-                last_command_check = time.monotonic()
+            # Every upload cycle checks commands first. If command polling fails,
+            # sync is intentionally skipped for this cycle so RESET_COUNTER can
+            # never be bypassed by a buffered event upload.
+            process_commands()
 
             synced = sync_events(state)
             if synced:
